@@ -1,0 +1,577 @@
+# Digital design lab: Verilog with Icarus, VHDL with GHDL and gates with yosys
+# Everything is installed by the setup below, from Ubuntu's archive, the first time it starts.
+cpus: 1
+memory: 1024    # MB
+disk: 10        # GB
+
+# Port 8000 shows the waveform pictures (SVG) the lab draws. Everything else is the terminal.
+open: [8000]
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq iverilog ghdl yosys python3
+  home=/home/student
+  [ -d $home ] || home=/root
+  mkdir -p /usr/share/hdllab /usr/local/lib/hdllab $home/hdl/out
+  cat > /usr/local/lib/hdllab/vcdlib.py <<'HDL_END'
+  """Reads a VCD file for vcd2txt and vcd2svg."""
+  import re, sys
+
+  EXP = {'s': 15, 'ms': 12, 'us': 9, 'ns': 6, 'ps': 3, 'fs': 0}
+
+  def read(path):
+      toks, names, hist, scope, t, i, unit = open(path).read().split(), {}, {}, [], 0, 0, '1 s'
+      while i < len(toks):
+          k = toks[i]
+          if k in ('$timescale', '$date', '$version', '$comment'):
+              j = toks.index('$end', i)
+              unit = ' '.join(toks[i + 1:j]) if k == '$timescale' else unit
+              i = j
+          elif k == '$scope':
+              scope.append(toks[i + 2]); i += 3
+          elif k == '$upscope':
+              scope.pop()
+          elif k == '$var':
+              code = toks[i + 3]
+              if code not in names:
+                  names[code] = ('.'.join(scope[1:] + [toks[i + 4]]), int(toks[i + 2])); hist[code] = []
+              i += 4
+          elif k[0] == '#':
+              t = int(k[1:])
+          elif k[0] in '01xzXZ' and len(k) > 1 and k[1:] in hist:
+              hist[k[1:]].append((t, k[0].lower()))
+          elif k[0] in 'bB' and i + 1 < len(toks) and toks[i + 1] in hist:
+              hist[toks[i + 1]].append((t, k[1:].lower())); i += 1
+          i += 1
+      return unit, names, hist, t
+
+  def step_of(arg, unit, times):
+      if arg is None:
+          gaps = [b - a for a, b in zip(times, times[1:]) if b > a]
+          return min(gaps) if gaps else 1
+      m, f = re.match(r'(\d+)\s*([a-z]*)$', arg), re.match(r'(\d+)\s*([a-z]+)', unit)
+      if not m:
+          sys.exit('vcd2txt: STEP is a whole number, like 5 or 5ns')
+      if not m.group(2):
+          return int(m.group(1))
+      per = int(f.group(1)) * 10 ** EXP[f.group(2)]
+      got = int(m.group(1)) * 10 ** EXP[m.group(2)] / per
+      if got < 1 or got != int(got):
+          sys.exit('vcd2txt: this file counts in %s, so %s is not a whole number of them' % (unit, arg))
+      return int(got)
+
+
+  number = lambda v: str(int(v, 2)) if set(v) <= set('01') else 'x'
+
+  def show(n, unit):
+      """n steps of the file's unit, in the largest unit that holds it evenly."""
+      if unit.replace(' ', '') == '1s':
+          return '%d time units' % n
+      m = re.match(r'(\d+)\s*([a-z]+)', unit)
+      fs = n * int(m.group(1)) * 10 ** EXP[m.group(2)]
+      for u, e in sorted(EXP.items(), key=lambda p: -p[1]):
+          if fs % 10 ** e == 0:
+              return '%d %s' % (fs // 10 ** e, u)
+  HDL_END
+  cat > /usr/local/bin/vcd2txt <<'HDL_END'
+  #!/usr/bin/python3
+  """vcd2txt FILE.vcd [STEP]: a VCD waveform as text, one row per signal.
+  One column per STEP time units (STEP may be 5 or 5ns). A one-bit signal is _ for 0 and # for 1,
+  a bus shows its number, x is unknown. With no STEP it uses the smallest gap between changes."""
+  import sys
+  sys.path.insert(0, '/usr/local/lib/hdllab')
+  from vcdlib import number, read, show, step_of
+
+  if len(sys.argv) not in (2, 3):
+      sys.exit(__doc__.split('\n')[0])
+  unit, names, hist, end = read(sys.argv[1])
+  times = sorted({t for h in hist.values() for t, _ in h})
+  step = step_of(sys.argv[2] if len(sys.argv) == 3 else None, unit, times)
+  if end // step > 200:
+      sys.exit('vcd2txt: %d columns is too many to read, give a bigger STEP (this file counts in %s)' % (end // step + 1, unit))
+  cell = max([len(number('1' * w)) for _, w in names.values()] + [1])
+  print('one column = %s, the file runs to %s' % (show(step, unit), show(end, unit)))
+  for code, (name, width) in names.items():
+      row, k, val = [], 0, 'x'
+      for tt in range(0, end + 1, step):
+          while k < len(hist[code]) and hist[code][k][0] <= tt:
+              val = hist[code][k][1]; k += 1
+          row.append(number(val).rjust(cell) if width > 1 else {'0': '_', '1': '#'}.get(val, 'x') * cell)
+      print('%-12s %s' % (name, ' '.join(row)))
+  HDL_END
+  cat > /usr/local/bin/vcd2svg <<'HDL_END'
+  #!/usr/bin/python3
+  """vcd2svg FILE.vcd OUT.svg: draw a VCD waveform as a picture. One-bit signals are lines that go
+  up and down, a bus is a row of boxes holding its number."""
+  import sys
+  sys.path.insert(0, '/usr/local/lib/hdllab')
+  from vcdlib import number, read, show
+
+  args = sys.argv[1:]
+  if len(args) != 2:
+      sys.exit(__doc__.split('\n')[0])
+  unit, names, hist, end = read(args[0])
+  end, W, X = max(end, 1), 700, 110
+  out = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" font-family="monospace" font-size="12">'
+         % (X + W + 20, 42 * len(names) + 30), '<rect width="100%" height="100%" fill="white"/>']
+  for r, (code, (name, width)) in enumerate(names.items()):
+      y, h = 40 + 42 * r, hist[code] + [(end, None)]
+      out.append('<text x="4" y="%d">%s</text>' % (y - 6, name))
+      if width == 1:
+          pts, last = [], 0
+          for (t, v), (t2, _) in zip(h, h[1:]):
+              lvl = {'0': 0, '1': 1}.get(v, 0.5)
+              pts += ['%.1f,%.1f' % (X + t * W / end, y - 22 * lvl), '%.1f,%.1f' % (X + t2 * W / end, y - 22 * lvl)]
+          out.append('<polyline fill="none" stroke="black" stroke-width="1.5" points="%s"/>' % ' '.join(pts))
+      else:
+          for (t, v), (t2, _) in zip(h, h[1:]):
+              x1, x2 = X + t * W / end, X + t2 * W / end
+              out.append('<rect x="%.1f" y="%d" width="%.1f" height="22" fill="none" stroke="black"/>' % (x1, y - 22, x2 - x1))
+              out.append('<text x="%.1f" y="%d" font-size="10">%s</text>' % (x1 + 3, y - 7, number(v)))
+  out.append('<text x="%d" y="%d">time 0 to %s</text></svg>' % (X, 42 * len(names) + 22, show(end, unit)))
+  open(args[1], 'w').write('\n'.join(out) + '\n')
+  print('wrote', args[1])
+  HDL_END
+  cat > /usr/local/bin/hdl <<'HDL_END'
+  #!/bin/bash
+  # hdl: helpers for the digital design lab.
+  #   hdl gates FILE.v TOP    synthesise FILE.v with yosys and count the cells it needs
+  #   hdl reset FILE          put a file in ~/hdl back as it was given
+  d=/home/student/hdl
+  [ -d $d ] || d=/root/hdl
+  case "$1" in
+    gates)
+      [ -f "$2" ] && [ -n "$3" ] || { echo "usage: hdl gates FILE.v TOP"; exit 1; }
+      yosys -q -p "read_verilog $2; synth -flatten -top $3; tee -o /dev/stdout stat" | sed -n '/Number of cells/,$p' ;;
+    reset)
+      [ -f "/usr/share/hdllab/$2" ] || { echo "hdl: no such lab file: $2"; exit 1; }
+      cp /usr/share/hdllab/$2 $d/$2 && echo "hdl: $2 is as it was given" ;;
+    *) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  esac
+  HDL_END
+  chmod 755 /usr/local/bin/vcd2txt /usr/local/bin/vcd2svg /usr/local/bin/hdl
+  cat > /usr/share/hdllab/half_adder.v <<'HDL_END'
+  // A half adder adds two bits: sum is the bit that stays, carry is the bit that moves left.
+  module half_adder(input a, input b, output sum, output carry);
+    assign sum = a ^ b;
+    assign carry = a & b;
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/half_adder_tb.v <<'HDL_END'
+  // A testbench has no ports. It drives the inputs of the design and prints what comes out.
+  module half_adder_tb;
+    reg a, b;
+    wire sum, carry;
+    half_adder dut(.a(a), .b(b), .sum(sum), .carry(carry));
+    integer i;
+    initial begin
+      $display(" a b | carry sum");
+      for (i = 0; i < 4; i = i + 1) begin
+        {a, b} = i;
+        #1 $display(" %b %b |   %b     %b", a, b, carry, sum);
+      end
+    end
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/full_adder.v <<'HDL_END'
+  // TODO: a full adder adds three bits: a, b and cin, the carry that came in from the right.
+  // Build it from two half_adder modules and an OR gate, or write it your own way.
+  module full_adder(input a, input b, input cin, output sum, output cout);
+    // your design here
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/full_adder_tb.v <<'HDL_END'
+  module full_adder_tb;
+    reg a, b, cin;
+    wire sum, cout;
+    full_adder dut(.a(a), .b(b), .cin(cin), .sum(sum), .cout(cout));
+    integer i, wrong;
+    initial begin
+      wrong = 0;
+      $display(" a b cin | cout sum");
+      for (i = 0; i < 8; i = i + 1) begin
+        {a, b, cin} = i;
+        #1 $display(" %b %b  %b  |   %b    %b", a, b, cin, cout, sum);
+        if ({cout, sum} !== a + b + cin) wrong = wrong + 1;
+      end
+      if (wrong == 0) $display("all 8 rows are right");
+      else $display("%0d rows are wrong", wrong);
+    end
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/counter.v <<'HDL_END'
+  // A 4-bit counter: q goes up by one on every rising edge of clk, and rst sets it to 0.
+  module counter(input clk, input rst, output reg [3:0] q);
+    always @(posedge clk)
+      if (rst) q <= 4'd0;
+      else q <= q + 4'd1;
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/counter_tb.v <<'HDL_END'
+  module counter_tb;
+    reg clk = 0, rst = 1;
+    wire [3:0] q;
+    counter dut(.clk(clk), .rst(rst), .q(q));
+    always #5 clk = ~clk;        // the clock: a new edge every 5 time units
+    initial begin
+      $dumpfile("out/counter.vcd");
+      $dumpvars(0, counter_tb);  // record every signal into the VCD file
+      #12 rst = 0;
+      #100 $display("after 112 time units q = %0d", q);
+      $finish;
+    end
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/counter4.v <<'HDL_END'
+  // TODO: a 4-bit counter with enable and a synchronous reset, checked on every rising edge of clk.
+  //   rst = 1: q becomes 0, whatever en is.   Otherwise en = 1: q goes up by one, and 15 wraps to 0.
+  //   Otherwise q keeps its value. Nothing may change q between two edges.
+  module counter4(input clk, input rst, input en, output reg [3:0] q);
+    // your design here
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/counter4_tb.v <<'HDL_END'
+  module counter4_tb;
+    reg clk = 0, rst = 1, en = 0;
+    wire [3:0] q;
+    counter4 dut(.clk(clk), .rst(rst), .en(en), .q(q));
+    always #5 clk = ~clk;
+    initial begin
+      $monitor("t=%0d rst=%b en=%b q=%0d", $time, rst, en, q);
+      #12 rst = 0; en = 1;   // count
+      #60 en = 0;            // hold
+      #20 rst = 1;           // reset
+      #10 $finish;
+    end
+  endmodule
+  HDL_END
+  cat > /usr/share/hdllab/half_adder.vhd <<'HDL_END'
+  library ieee;
+  use ieee.std_logic_1164.all;
+
+  -- A half adder in VHDL: the entity is the box, the architecture is what is inside it.
+  entity half_adder is
+    port (a, b : in std_logic; sum, carry : out std_logic);
+  end entity;
+
+  architecture rtl of half_adder is
+  begin
+    sum <= a xor b;
+    carry <= a and b;
+  end architecture;
+  HDL_END
+  cat > /usr/share/hdllab/half_adder_tb.vhd <<'HDL_END'
+  library ieee;
+  use ieee.std_logic_1164.all;
+
+  entity half_adder_tb is
+  end entity;
+
+  architecture sim of half_adder_tb is
+    signal a, b, sum, carry : std_logic := '0';
+  begin
+    dut: entity work.half_adder port map (a => a, b => b, sum => sum, carry => carry);
+    process
+    begin
+      for i in 0 to 3 loop
+        a <= '0'; b <= '0';
+        if i >= 2 then a <= '1'; end if;
+        if i mod 2 = 1 then b <= '1'; end if;
+        wait for 10 ns;
+        report "a=" & std_logic'image(a) & " b=" & std_logic'image(b) &
+               " carry=" & std_logic'image(carry) & " sum=" & std_logic'image(sum);
+      end loop;
+      wait;
+    end process;
+  end architecture;
+  HDL_END
+  cat > /usr/share/hdllab/full_adder.vhd <<'HDL_END'
+  library ieee;
+  use ieee.std_logic_1164.all;
+
+  -- TODO: a full adder in VHDL. sum and cout are the two bits of a + b + cin.
+  entity full_adder is
+    port (a, b, cin : in std_logic; sum, cout : out std_logic);
+  end entity;
+
+  architecture rtl of full_adder is
+  begin
+    -- your design here
+  end architecture;
+  HDL_END
+  cat > /usr/share/hdllab/full_adder_tb.vhd <<'HDL_END'
+  library ieee;
+  use ieee.std_logic_1164.all;
+
+  entity full_adder_tb is
+  end entity;
+
+  architecture sim of full_adder_tb is
+    signal a, b, cin, sum, cout : std_logic := '0';
+  begin
+    dut: entity work.full_adder port map (a => a, b => b, cin => cin, sum => sum, cout => cout);
+    process
+    begin
+      for i in 0 to 7 loop
+        a <= '0'; b <= '0'; cin <= '0';
+        if i >= 4 then a <= '1'; end if;
+        if (i / 2) mod 2 = 1 then b <= '1'; end if;
+        if i mod 2 = 1 then cin <= '1'; end if;
+        wait for 10 ns;
+        report "a=" & std_logic'image(a) & " b=" & std_logic'image(b) & " cin=" & std_logic'image(cin) &
+               " cout=" & std_logic'image(cout) & " sum=" & std_logic'image(sum);
+      end loop;
+      wait;
+    end process;
+  end architecture;
+  HDL_END
+  cp -n /usr/share/hdllab/* $home/hdl/
+  cat > $home/README.md <<'HDL_README_END'
+  # Lab: digital design with Verilog and VHDL
+
+  You describe a circuit in a hardware description language and a simulator runs it. Nothing
+  here is wired up: Icarus Verilog (iverilog, vvp) and GHDL (ghdl) simulate it, and yosys turns
+  it into gates. Your files are in ~/hdl. Work there: cd ~/hdl
+
+  ## Part 1: a combinational circuit (Verilog)
+
+  half_adder.v and half_adder_tb.v are given. A testbench has no ports: it drives the inputs and
+  prints the outputs.
+
+      iverilog -o half half_adder.v half_adder_tb.v
+      vvp half
+
+  Read the truth table. Then write full_adder.v (a + b + cin, as sum and cout), from two
+  half_adder modules and an OR, or your own way. full_adder_tb.v prints its table and says if
+  every row is right. Compile it with both files: iverilog -o fa half_adder.v full_adder.v full_adder_tb.v
+
+  ## Part 2: a clock and a waveform
+
+  counter.v is a 4-bit counter. counter_tb.v records every signal in out/counter.vcd.
+
+      iverilog -o counter counter.v counter_tb.v
+      vvp counter
+      vcd2txt out/counter.vcd 5
+
+  Each row is a signal, each column 5 time units. Read when q changes, and why. vcd2svg
+  out/counter.vcd out/counter.svg draws a picture. Open the lab's port 8000 in the browser
+  to see out/ and click the picture.
+
+  ## Part 3: the same circuit in VHDL
+
+  half_adder.vhd and half_adder_tb.vhd are given. GHDL takes three steps: analyse, elaborate, run.
+
+      ghdl -a half_adder.vhd half_adder_tb.vhd
+      ghdl -e half_adder_tb
+      ghdl -r half_adder_tb --vcd=out/half_adder.vcd
+
+  Write full_adder.vhd (the entity is given, fill in the architecture) and test it with
+  full_adder_tb.vhd. vcd2txt out/half_adder.vcd 10ns shows the waveform.
+
+  ## Part 4: finish a design
+
+  counter4.v is a counter with an enable and a synchronous reset. Its comment says how it must
+  behave. counter4_tb.v is only a first look: your teacher's check is much harder on it.
+
+  ## Part 5: how many gates?
+
+  hdl gates counter4.v counter4 turns your design into gates with yosys and counts them. A
+  flip-flop remembers one bit; a latch is a mistake. Look at the cells: why 4 flip-flops?
+
+  ## The tools
+
+  - hdl gates FILE.v TOP    count the gates yosys makes from FILE.v
+  - hdl reset FILE          put a file back as it was given
+  - vcd2txt FILE.vcd STEP   a waveform as text
+  - vcd2svg FILE.vcd OUT    a waveform as a picture
+
+  Your teacher's check compiles full_adder.v, full_adder.vhd and counter4.v with its own
+  testbenches, so a design that only works with the testbench you were given does not pass.
+  HDL_README_END
+  chown -R student:student $home/hdl $home/README.md 2>/dev/null
+  echo "Read README.md in your home folder first." > /etc/motd
+  u=student
+  id student >/dev/null 2>&1 || u=root
+  cat > /etc/systemd/system/hdl-view.service <<'HDL_UNIT_END'
+  [Unit]
+  Description=Show the waveform pictures in the hdl lab's out folder on port 8000
+  After=network.target
+
+  [Service]
+  User=USER_
+  ExecStart=/usr/bin/python3 -m http.server 8000 --directory HOME_/hdl/out
+  Restart=on-failure
+
+  [Install]
+  WantedBy=multi-user.target
+  HDL_UNIT_END
+  sed -i "s|USER_|$u|;s|HOME_|$home|" /etc/systemd/system/hdl-view.service
+  systemctl daemon-reload
+  systemctl enable --now hdl-view >/dev/null 2>&1
+
+# Marks a handed-in VM, KAN-29: run as root on a copy of the saved disk after a fresh boot, so
+# it sees only what was saved. Its exit status is the result: 0 passes.
+check: |
+  d=/home/student/hdl
+  [ -d $d ] || d=/root/hdl
+  w=$(mktemp -d)
+  fail() { echo "NOT PASSED: $*"; exit 1; }
+  for tool in iverilog vvp ghdl yosys; do command -v $tool >/dev/null || fail "$tool is not installed"; done
+  for f in full_adder.v full_adder.vhd counter4.v; do [ -s $d/$f ] || fail "$f is missing from $d"; done
+  # A design may not end or reach outside the simulation: only the check's testbench prints the result.
+  grep -qE '\$(finish|stop|fatal|fopen|fwrite|system|readmem|value\$plusargs|test\$plusargs)' $d/full_adder.v $d/counter4.v && fail "a Verilog file calls a system task that ends or leaves the simulation (finish, stop, fatal, fopen, system): take it out, comments too"
+  grep -qiE 'textio|std\.env|severity +failure' $d/full_adder.vhd && fail "full_adder.vhd uses textio, std.env or severity failure: a design must not end or leave the simulation"
+  nonce() { echo $(( (RANDOM * 32768 + RANDOM) % 1000000000 + 1 )); }
+  # verdict LABEL OUTPUT NONCE MIN: the testbench's own line, with this run's number in it, is the only proof.
+  verdict() {
+    line=$(echo "$2" | grep "RESULT $3 checks=" | head -1)
+    [ -n "$line" ] || fail "$1: the simulation did not finish and print its result: $(echo "$2" | tail -n 2 | tr '\n' ' ')"
+    checks=$(echo "$line" | sed 's/.*checks=\([0-9]*\).*/\1/')
+    bad=$(echo "$line" | sed 's/.*bad=\([0-9]*\).*/\1/')
+    [ "$checks" -ge $4 ] || fail "$1: only $checks hidden checks ran, wanted $4"
+    [ "$bad" = 0 ] || fail "$1: $bad of $checks hidden checks gave a wrong output. $(echo "$2" | grep MISMATCH | head -n 3 | tr '\n' ' ')"
+  }
+  # synth LABEL TOP MAXCELLS MINFF MAXFF FILES: yosys must read it, find no latch and a sensible size.
+  synth() {
+    l=$1; t=$2; mc=$3; mn=$4; mx=$5; shift 5
+    yosys -q -p "read_verilog $*; synth -flatten -top $t; tee -o $w/$t.stat stat" >$w/$t.log 2>&1 || fail "$l: yosys cannot synthesise it: $(grep -m1 -i error $w/$t.log)"
+    grep -q DLATCH $w/$t.stat && fail "$l: it makes a latch (an output that is not set on every path)"
+    cells=$(grep -m1 'Number of cells' $w/$t.stat | sed 's/[^0-9]//g')
+    [ -n "$cells" ] || cells=0
+    ffs=$(awk '/DFF/ {n += $NF} END {print n + 0}' $w/$t.stat)
+    [ "$ffs" -ge $mn ] && [ "$ffs" -le $mx ] || fail "$l: it has $ffs flip-flops, and a $t needs between $mn and $mx"
+    [ "$cells" -le $mc ] || fail "$l: it needs $cells cells, more than the $mc a plain design takes"
+  }
+  # Verilog full adder. It may use half_adder.v or stand alone.
+  cat > $w/fa_tb.v <<'TB_END'
+  module tbh #(parameter NONCE = 0);
+    reg a, b, cin;
+    wire sum, cout;
+    integer i, bad, checks;
+    reg [1:0] want;
+    full_adder dut(.a(a), .b(b), .cin(cin), .sum(sum), .cout(cout));
+    initial begin
+      bad = 0; checks = 0;
+      for (i = 15; i >= 0; i = i - 1) begin
+        {a, b, cin} = i[2:0];
+        #1;
+        want = {1'b0, a} + {1'b0, b} + {1'b0, cin};
+        checks = checks + 1;
+        if ({cout, sum} !== want) begin
+          bad = bad + 1;
+          if (bad <= 3) $display("MISMATCH a=%b b=%b cin=%b gave cout=%b sum=%b", a, b, cin, cout, sum);
+        end
+      end
+      $display("RESULT %0d checks=%0d bad=%0d", NONCE, checks, bad);
+      $finish;
+    end
+  endmodule
+  TB_END
+  n=$(nonce)
+  files="$d/half_adder.v $d/full_adder.v"
+  [ -f $d/half_adder.v ] || files=$d/full_adder.v
+  iverilog -o $w/fa.vvp -Ptbh.NONCE=$n $w/fa_tb.v $files 2>$w/fa.err || files=$d/full_adder.v
+  iverilog -o $w/fa.vvp -Ptbh.NONCE=$n $w/fa_tb.v $files 2>$w/fa.err || fail "full_adder.v does not compile: $(head -n 2 $w/fa.err | tr '\n' ' ')"
+  out=$(timeout 30 vvp $w/fa.vvp 2>&1)
+  verdict "full_adder.v" "$out" $n 16
+  synth "full_adder.v" full_adder 15 0 0 $files
+  # VHDL full adder with GHDL.
+  cat > $w/fa_tb.vhd <<'TB_END'
+  library ieee;
+  use ieee.std_logic_1164.all;
+
+  entity tbh is
+    generic (NONCE : integer := 0);
+  end entity;
+
+  architecture t of tbh is
+    signal a, b, cin, sum, cout : std_logic := '0';
+    function bit_of(n : integer) return std_logic is
+    begin
+      if n = 1 then return '1'; else return '0'; end if;
+    end function;
+  begin
+    dut: entity work.full_adder port map (a => a, b => b, cin => cin, sum => sum, cout => cout);
+    process
+      variable n, x, y, z, bad, checks : integer := 0;
+    begin
+      for i in 15 downto 0 loop
+        n := i mod 8; x := n / 4; y := (n / 2) mod 2; z := n mod 2;
+        a <= bit_of(x); b <= bit_of(y); cin <= bit_of(z);
+        wait for 1 ns;
+        checks := checks + 1;
+        if sum /= bit_of((x + y + z) mod 2) or cout /= bit_of((x + y + z) / 2) then
+          bad := bad + 1;
+          if bad <= 3 then
+            report "MISMATCH a=" & std_logic'image(a) & " b=" & std_logic'image(b) & " cin=" & std_logic'image(cin) &
+                   " gave cout=" & std_logic'image(cout) & " sum=" & std_logic'image(sum);
+          end if;
+        end if;
+      end loop;
+      report "RESULT " & integer'image(NONCE) & " checks=" & integer'image(checks) & " bad=" & integer'image(bad);
+      wait;
+    end process;
+  end architecture;
+  TB_END
+  mkdir $w/v && cp $d/full_adder.vhd $w/v/ && cp $w/fa_tb.vhd $w/v/
+  [ -f $d/half_adder.vhd ] && cp $d/half_adder.vhd $w/v/
+  n=$(nonce)
+  cd $w/v
+  src="full_adder.vhd fa_tb.vhd"
+  [ -f half_adder.vhd ] && src="half_adder.vhd $src"
+  ghdl -a $src >$w/ghdl.log 2>&1 || fail "full_adder.vhd does not compile with ghdl: $(head -n 2 $w/ghdl.log | tr '\n' ' ')"
+  ghdl -e tbh >>$w/ghdl.log 2>&1 || fail "full_adder.vhd does not elaborate with ghdl: $(head -n 2 $w/ghdl.log | tr '\n' ' ')"
+  out=$(timeout 30 ghdl -r tbh -gNONCE=$n --stop-time=1us 2>&1)
+  verdict "full_adder.vhd" "$out" $n 16
+  cd $w
+  # The counter with enable and a synchronous reset: a model inside the testbench is compared before and after every edge.
+  cat > $w/c4_tb.v <<'TB_END'
+  module tbh #(parameter NONCE = 0);
+    reg clk = 0, rst = 0, en = 0, known = 0;
+    wire [3:0] q;
+    reg [3:0] model;
+    integer bad = 0, checks = 0, i, seed = 7;
+    counter4 dut(.clk(clk), .rst(rst), .en(en), .q(q));
+    task chk;
+      begin
+        checks = checks + 1;
+        if (known && q !== model) begin
+          bad = bad + 1;
+          if (bad <= 3) $display("MISMATCH at %0d: rst=%b en=%b q=%b, wanted %b", $time, rst, en, q, model);
+        end
+      end
+    endtask
+    task cycle(input r, input e);
+      begin
+        rst = r; en = e; #2;
+        chk;
+        clk = 1; #1;
+        if (r) begin model = 0; known = 1; end
+        else if (e) model = model + 1;
+        chk;
+        #2 clk = 0; #2;
+      end
+    endtask
+    initial begin
+      model = 0;
+      cycle(1, 0); cycle(1, 1);
+      for (i = 0; i < 20; i = i + 1) cycle(0, 1);
+      for (i = 0; i < 3; i = i + 1) cycle(0, 0);
+      cycle(0, 1); cycle(0, 1); cycle(1, 1);
+      for (i = 0; i < 5; i = i + 1) cycle(0, 1);
+      cycle(1, 0);
+      for (i = 0; i < 5; i = i + 1) cycle(0, 1);
+      for (i = 0; i < 300; i = i + 1) cycle(($random(seed) & 7) == 0, ($random(seed) & 3) != 0);
+      $display("RESULT %0d checks=%0d bad=%0d", NONCE, checks, bad);
+      $finish;
+    end
+  endmodule
+  TB_END
+  n=$(nonce)
+  iverilog -o $w/c4.vvp -Ptbh.NONCE=$n $w/c4_tb.v $d/counter4.v 2>$w/c4.err || fail "counter4.v does not compile: $(head -n 2 $w/c4.err | tr '\n' ' ')"
+  out=$(timeout 30 vvp $w/c4.vvp 2>&1)
+  verdict "counter4.v" "$out" $n 600
+  synth "counter4.v" counter4 20 4 8 $d/counter4.v
+  echo "PASSED: full_adder.v and full_adder.vhd add correctly, and counter4.v counts, holds, wraps and resets as specified, with no latch and a small netlist"
